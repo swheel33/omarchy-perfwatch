@@ -11,10 +11,10 @@ see whether sustained pressure occurred while you were away.
 - Detects sustained memory PSI, CPU saturation, and I/O PSI, with swap as supporting evidence.
 - Ignores isolated spikes by requiring three of four triggering samples.
 - Keeps two minutes of pre-event context and records peak and recovery data.
-- Records the top five individual processes by relevant CPU, memory, or I/O use.
+- Records relevant CPU and I/O processes and groups the biggest memory users by application.
 - Merges related incidents separated by no more than one minute.
 - Provides 24-hour, 7-day, and 30-day views in a keyboard-friendly popup.
-- Uses a quiet bar icon when healthy and a bar-only indicator for recent events.
+- Uses a quiet bar icon when healthy and a red indicator only while pressure is active.
 - Runs without root privileges, external Python packages, or desktop notifications.
 
 ## Installation
@@ -32,8 +32,8 @@ omarchy bar move swheel33.perfwatch --section right
 ```
 
 The shell hot-reloads plugin and bar changes. Click the bar icon to open the
-history panel. Select an incident to expand its peak and recovery details.
-Clearing history requires two clicks within five seconds.
+history panel and review each incident's plain-language cause and biggest
+memory users. Clearing history requires two clicks within five seconds.
 
 ## Storage And Privacy
 
@@ -54,9 +54,10 @@ and suspend or sampling gaps are handled without treating invalid deltas as
 incidents.
 
 Process rows contain only a resolved application or executable name, PID, RSS,
-CPU share, and I/O rate. They never contain full command lines, arguments,
-window titles, document names, URLs, or environment values. Separate processes
-are not grouped, even when they belong to the same application.
+CPU share, and I/O rate. Memory totals may group processes under their resolved
+application or parent application. Persisted data never contains full command
+lines, arguments, paths, window titles, document names, URLs, or environment
+values.
 
 ## Detection
 
@@ -66,7 +67,7 @@ threshold. It is added to history only after recovery:
 | Signal | Starting threshold |
 | --- | --- |
 | Memory pressure | `/proc/pressure/memory` `some avg10` at least 10% |
-| Swap activity | Supporting evidence above 256 pages/s; never a standalone trigger |
+| Swap activity | Supporting evidence above 256 pages/s; never a standalone trigger or a high-severity signal by itself |
 | CPU saturation | CPU utilization at least 95% and CPU PSI `some avg10` at least 20% |
 | I/O pressure | `/proc/pressure/io` `some avg10` at least 15% |
 
@@ -95,10 +96,6 @@ Run a one-shot collector check against a temporary state file with:
 ```sh
 python3 collector.py --once --state-file /tmp/perfwatch-state.json
 ```
-
-## Screenshots
-
-Screenshots will be added after the first tagged release.
 
 ## License
 

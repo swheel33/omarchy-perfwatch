@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "swheel33.perfwatch",
   "name": "Perfwatch",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "swheel33",
   "license": "MIT",
   "description": "Record and review sustained Linux performance incidents from the Omarchy bar.",

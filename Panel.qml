@@ -22,15 +22,16 @@ Panel {
   property var state: ({ incidents: [] })
   property int stateRevision: 0
   property int filterDays: 1
-  property string expandedId: ""
   property bool clearArmed: false
   property bool cursorActive: false
   property int selectedIndex: 0
   property double nowMs: Date.now()
 
   readonly property var incidents: filteredIncidents()
+  readonly property var activeIncident: state && state.activeIncident && state.activeIncident.id ? state.activeIncident : null
+  readonly property var displayRows: activeIncident ? [activeIncident].concat(incidents) : incidents
   readonly property int recentCount: countSince(24 * 3600 * 1000)
-  readonly property bool hasSignal: recentCount > 0
+  readonly property bool hasActiveIncident: activeIncident !== null
 
   function filteredIncidents() {
     var revision = stateRevision
@@ -60,7 +61,7 @@ Panel {
       if (!parsed || parsed.schemaVersion !== 1 || !Array.isArray(parsed.incidents)) return
       state = parsed
       stateRevision++
-      selectedIndex = Math.max(0, Math.min(selectedIndex, filteredIncidents().length - 1))
+      selectedIndex = Math.max(0, Math.min(selectedIndex, displayRows.length - 1))
       if (clearArmed && parsed.incidents.length === 0) clearArmed = false
     } catch (error) {
       console.warn("perfwatch", "Ignoring malformed state", error)
@@ -70,21 +71,14 @@ Panel {
   function setFilter(days) {
     filterDays = days
     selectedIndex = 0
-    expandedId = ""
   }
 
   function select(delta) {
-    if (incidents.length === 0) return
+    if (displayRows.length === 0) return
     cursorActive = true
-    selectedIndex = Math.max(0, Math.min(incidents.length - 1, selectedIndex + delta))
+    selectedIndex = Math.max(0, Math.min(displayRows.length - 1, selectedIndex + delta))
     var target = incidentRepeater.itemAt(selectedIndex)
     if (target) panelScroll.contentY = Math.max(0, Math.min(target.y, panelScroll.contentHeight - panelScroll.height))
-  }
-
-  function toggleSelected() {
-    if (incidents.length === 0) return
-    var id = String(incidents[selectedIndex].id || "")
-    expandedId = expandedId === id ? "" : id
   }
 
   function requestClear() {
@@ -116,33 +110,59 @@ Panel {
     return Number(row && row.severityLevel || 0) >= 2 ? urgent : foreground
   }
 
-  function detailText(row) {
+  function isActive(row) {
+    return activeIncident !== null && String(row && row.id || "") === String(activeIncident.id || "")
+  }
+
+  function causeText(row) {
+    var causes = row && row.causes && typeof row.causes.length === "number" ? row.causes : []
     var peak = row && row.peak ? row.peak : {}
-    var recovery = row && row.recovery ? row.recovery : {}
-    var parts = []
-    if (Number(peak.cpuPercent || 0) > 0) parts.push("CPU " + Math.round(peak.cpuPercent) + "%")
-    if (Number(peak.memoryPsi || 0) > 0) parts.push("memory PSI " + Number(peak.memoryPsi).toFixed(1) + "%")
-    if (Number(peak.ioPsi || 0) > 0) parts.push("I/O PSI " + Number(peak.ioPsi).toFixed(1) + "%")
-    if (Number(peak.swapPagesPerSecond || 0) > 0) parts.push("swap " + Number(peak.swapPagesPerSecond).toFixed(1) + " pages/s")
-    if (Number(peak.memoryAvailableMiB || 0) > 0) parts.push(Math.round(peak.memoryAvailableMiB) + " MiB available")
-    var text = parts.join("  ·  ")
-    var reason = String(recovery.reason || "")
-    if (reason === "recovered") text += (text ? "\n" : "") + String(recovery.summary || "Pressure returned below the recovery threshold")
-    else if (reason === "suspend_gap") text += (text ? "\n" : "") + "Ended across a suspend or sampling gap"
-    else if (reason === "collector_restart") text += (text ? "\n" : "") + "Collector restarted before recovery was observed"
+    var hasMemory = causes.indexOf("memory") !== -1
+    var hasSwap = causes.indexOf("swap") !== -1
+    var hasCpu = causes.indexOf("cpu") !== -1
+    var hasIo = causes.indexOf("io") !== -1
+    var text = "The system was under resource pressure."
+    if (hasMemory && hasSwap) text = "The system ran low on readily available memory and started swapping, which caused the slowdown."
+    else if (hasMemory) text = "Applications were waiting for memory, which caused the slowdown."
+    else if (hasCpu) text = "The processor was fully occupied, so applications had to wait for CPU time."
+    else if (hasIo && hasSwap) text = "Heavy swapping made storage a bottleneck and caused the slowdown."
+    else if (hasIo) text = "Applications were waiting on storage, which caused the slowdown."
+    var available = Number(peak.memoryAvailableMiB || 0)
+    if ((hasMemory || hasSwap) && available > 0) text += " About " + Math.round(available) + " MiB was readily available at the worst point."
     return text
   }
 
-  function offenderRows(row) {
-    return row && row.offenders && Array.isArray(row.offenders.peak) ? row.offenders.peak : []
+  function memoryContributors(row) {
+    var stored = row && row.memoryOffenders
+    if (stored && typeof stored.length === "number") return stored
+    var raw = row && row.offenders && row.offenders.preEvent && typeof row.offenders.preEvent.length === "number" ? row.offenders.preEvent : []
+    var seen = {}
+    var result = []
+    for (var i = 0; i < raw.length; i++) {
+      var item = raw[i]
+      var key = String(item.name || "Unknown")
+      if (seen[key] === undefined) {
+        seen[key] = result.length
+        result.push({
+          name: key === "node" ? "Node development task" : key,
+          processCount: Number(item.processCount || 1),
+          rssMiB: Number(item.rssMiB || 0),
+        })
+      } else {
+        var existing = result[seen[key]]
+        existing.rssMiB += Number(item.rssMiB || 0)
+        existing.processCount += Number(item.processCount || 1)
+      }
+    }
+    result.sort(function(left, right) { return right.rssMiB - left.rssMiB })
+    return result.slice(0, 3)
   }
 
-  function offenderUsage(row) {
-    var parts = []
-    if (Number(row.rssMiB || 0) > 0) parts.push(Number(row.rssMiB).toFixed(0) + " MiB")
-    if (Number(row.cpuPercent || 0) >= 0.1) parts.push(Number(row.cpuPercent).toFixed(1) + "% CPU")
-    if (Number(row.ioMiBPerSecond || 0) >= 0.01) parts.push(Number(row.ioMiBPerSecond).toFixed(2) + " MiB/s I/O")
-    return parts.join("  ·  ")
+  function memoryUsage(row) {
+    var memory = Number(row.rssMiB || 0)
+    var amount = memory >= 1024 ? (memory / 1024).toFixed(1) + " GiB" : Math.round(memory) + " MiB"
+    var count = Number(row.processCount || 1)
+    return amount + (count > 1 ? " across " + count + " processes" : "")
   }
 
   visible: true
@@ -225,8 +245,8 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: "󰓅"
-    active: root.hasSignal
-    tooltipText: root.recentCount > 0 ? root.recentCount + " incident" + (root.recentCount === 1 ? "" : "s") + " in 24 hours" : "No recent performance incidents"
+    active: root.hasActiveIncident
+    tooltipText: root.hasActiveIncident ? "Performance pressure active: " + String(root.activeIncident.likelyCause || "Resource pressure") : (root.recentCount > 0 ? root.recentCount + " recovered incident" + (root.recentCount === 1 ? "" : "s") + " in 24 hours" : "No active performance pressure")
     onPressed: root.toggle()
   }
 
@@ -247,7 +267,7 @@ Panel {
         if (dx !== 0) root.setFilter(dx < 0 ? (root.filterDays === 30 ? 7 : 1) : (root.filterDays === 1 ? 7 : 30))
         if (dy !== 0) root.select(dy)
       }
-      onActivateRequested: root.toggleSelected()
+      onActivateRequested: function() {}
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
@@ -274,13 +294,13 @@ Panel {
           PanelHero {
             width: parent.width
             title: "Performance history"
-            meta: root.recentCount > 0 ? root.recentCount + " in the last 24 hours" : "No incidents in the last 24 hours"
+            meta: root.hasActiveIncident ? "PRESSURE ACTIVE NOW" : (root.recentCount > 0 ? root.recentCount + " recovered in the last 24 hours" : "No incidents in the last 24 hours")
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
               Text {
                 text: "󰓅"
-                color: root.hasSignal ? root.urgent : root.foreground
+                color: root.hasActiveIncident ? root.urgent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
               }
@@ -311,7 +331,7 @@ Panel {
           }
 
           Text {
-            visible: root.incidents.length === 0
+            visible: root.displayRows.length === 0
             width: parent.width
             topPadding: Style.space(24)
             bottomPadding: Style.space(24)
@@ -325,7 +345,7 @@ Panel {
 
           Repeater {
             id: incidentRepeater
-            model: root.incidents
+            model: root.displayRows
 
             BorderSurface {
               id: incidentRow
@@ -333,7 +353,7 @@ Panel {
               required property int index
               width: panelColumn.width
               implicitHeight: incidentContent.implicitHeight + Style.space(20)
-              color: root.expandedId === String(modelData.id || "") ? Style.selectedFillFor(root.foreground, Color.accent) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
               borderSpec: Border.flat(root.cursorActive && root.selectedIndex === index ? root.foreground : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16), 1)
               radius: Style.cornerRadius
 
@@ -352,7 +372,8 @@ Panel {
                     id: whenText
                     anchors.left: parent.left
                     anchors.right: durationText.left
-                    text: root.formatWhen(incidentRow.modelData.startTime)
+                    anchors.rightMargin: Style.space(8)
+                    text: root.isActive(incidentRow.modelData) ? "Happening now" : root.formatWhen(incidentRow.modelData.startTime)
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -371,62 +392,75 @@ Panel {
 
                 Text {
                   width: parent.width
-                  text: String(incidentRow.modelData.severity || "low").toUpperCase() + "  ·  " + String(incidentRow.modelData.likelyCause || "Resource pressure")
-                  color: root.severityColor(incidentRow.modelData)
+                  text: (root.isActive(incidentRow.modelData) ? "LIVE  ·  " : "") + String(incidentRow.modelData.severity || "moderate").toUpperCase() + (root.isActive(incidentRow.modelData) ? "" : "  ·  Recovered")
+                  color: root.isActive(incidentRow.modelData) ? root.urgent : root.severityColor(incidentRow.modelData)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
                 }
 
                 Text {
-                  visible: root.expandedId === String(incidentRow.modelData.id || "")
                   width: parent.width
                   topPadding: Style.space(5)
-                  text: root.detailText(incidentRow.modelData)
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
-                }
-
-                Text {
-                  visible: root.expandedId === String(incidentRow.modelData.id || "") && root.offenderRows(incidentRow.modelData).length > 0
-                  width: parent.width
-                  topPadding: Style.space(6)
-                  text: "TOP OFFENDERS"
+                  text: "CAUSE"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
 
-                Repeater {
-                  model: root.expandedId === String(incidentRow.modelData.id || "") ? root.offenderRows(incidentRow.modelData) : []
+                Text {
+                  width: parent.width
+                  text: root.causeText(incidentRow.modelData)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
 
-                  Item {
-                    required property var modelData
-                    width: incidentContent.width
-                    implicitHeight: Math.max(offenderName.implicitHeight, offenderUsage.implicitHeight)
+                Column {
+                  width: parent.width
+                  visible: root.memoryContributors(incidentRow.modelData).length > 0
+                  spacing: Style.space(6)
 
-                    Text {
-                      id: offenderName
-                      anchors.left: parent.left
-                      anchors.right: offenderUsage.left
-                      anchors.rightMargin: Style.space(8)
-                      text: String(modelData.name || "Unknown") + "  ·  PID " + Number(modelData.pid || 0)
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                    }
+                  Text {
+                    width: parent.width
+                    topPadding: Style.space(6)
+                    text: "BIGGEST MEMORY USERS"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
 
-                    Text {
-                      id: offenderUsage
-                      anchors.right: parent.right
-                      text: root.offenderUsage(modelData)
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                  Repeater {
+                    model: root.memoryContributors(incidentRow.modelData)
+
+                    Item {
+                      required property var modelData
+                      width: incidentContent.width
+                      implicitHeight: Math.max(contributorName.implicitHeight, contributorUsage.implicitHeight)
+
+                      Text {
+                        id: contributorName
+                        anchors.left: parent.left
+                        anchors.right: contributorUsage.left
+                        anchors.rightMargin: Style.space(8)
+                        text: String(modelData.name || "Unknown")
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
+
+                      Text {
+                        id: contributorUsage
+                        anchors.right: parent.right
+                        text: root.memoryUsage(modelData)
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
                     }
                   }
                 }
@@ -438,8 +472,6 @@ Panel {
                 onEntered: { root.cursorActive = true; root.selectedIndex = incidentRow.index }
                 onClicked: {
                   root.selectedIndex = incidentRow.index
-                  var id = String(incidentRow.modelData.id || "")
-                  root.expandedId = root.expandedId === id ? "" : id
                 }
               }
             }

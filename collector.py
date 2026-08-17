@@ -167,7 +167,7 @@ class DesktopNames:
         return self.by_executable.get(executable, "")
 
 
-def parse_process_stat(text: str) -> tuple[str, int, int, int]:
+def parse_process_stat(text: str) -> tuple[str, int, int, int, int]:
     left = text.find("(")
     right = text.rfind(")")
     if left < 0 or right <= left:
@@ -175,7 +175,7 @@ def parse_process_stat(text: str) -> tuple[str, int, int, int]:
     fields = text[right + 2 :].split()
     if len(fields) < 22:
         raise ValueError("short process stat")
-    return text[left + 1 : right], int(fields[11]) + int(fields[12]), int(fields[19]), int(fields[21])
+    return text[left + 1 : right], int(fields[1]), int(fields[11]) + int(fields[12]), int(fields[19]), int(fields[21])
 
 
 def parse_process_io(text: str) -> int:
@@ -188,19 +188,72 @@ def parse_process_io(text: str) -> int:
     return total
 
 
-def script_basename(proc_path: Path, executable: str) -> str:
+def process_arguments(proc_path: Path) -> list[str]:
+    try:
+        raw = (proc_path / "cmdline").read_bytes().split(b"\0")[1:8]
+    except OSError:
+        return []
+    return [argument.decode("utf-8", errors="replace") for argument in raw if argument]
+
+
+def runtime_tool_name(proc_path: Path, executable: str) -> str:
     interpreters = {"python", "python3", "pypy", "pypy3", "node", "ruby", "perl", "bash", "sh"}
     if executable not in interpreters:
         return ""
-    try:
-        arguments = (proc_path / "cmdline").read_bytes().split(b"\0")[1:4]
-    except OSError:
-        return ""
-    for argument in arguments:
-        value = argument.decode("utf-8", errors="replace")
+    arguments = process_arguments(proc_path)
+    if executable == "node":
+        tools = {
+            "tsc": "TypeScript compiler",
+            "tsc.js": "TypeScript compiler",
+            "eslint": "ESLint",
+            "eslint.js": "ESLint",
+            "vite": "Application build",
+            "vite.js": "Application build",
+            "next": "Application build",
+            "vinxi": "Application build",
+        }
+        for argument in arguments:
+            basename = Path(argument).name.lower()
+            if basename in tools:
+                return tools[basename]
+            for token, label in tools.items():
+                if token in basename:
+                    return label
+    for value in arguments:
         if value and not value.startswith("-") and Path(value).suffix.lower() in (".py", ".js", ".mjs", ".rb", ".pl", ".sh"):
             return Path(value).name[:80]
     return ""
+
+
+def friendly_process_name(name: str) -> str:
+    aliases = {"opencode": "OpenCode", "chromium": "Chromium", "node": "Node", "python3": "Python"}
+    return aliases.get(name.lower(), name)
+
+
+def parent_owner(row: dict[str, Any], by_pid: dict[int, dict[str, Any]]) -> str:
+    generic = {"bash", "sh", "node", "python", "python3", "pnpm", "npm", "yarn"}
+    parent = int(row.get("ppid", 0))
+    for _ in range(6):
+        candidate = by_pid.get(parent)
+        if not candidate:
+            break
+        executable = str(candidate.get("executable", ""))
+        name = str(candidate.get("name", executable))
+        if executable not in generic and name.lower() not in generic:
+            return friendly_process_name(name)
+        parent = int(candidate.get("ppid", 0))
+    return ""
+
+
+def aggregate_memory_apps(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = str(row.get("ownerName") or row.get("name") or "Unknown")
+        entry = grouped.setdefault(name, {"name": name, "rssMiB": 0.0, "processCount": 0})
+        entry["rssMiB"] += max(0.0, float(row.get("rssMiB", 0)))
+        entry["processCount"] += 1
+    ranked = sorted(grouped.values(), key=lambda item: float(item["rssMiB"]), reverse=True)
+    return [{**item, "rssMiB": round(float(item["rssMiB"]), 1)} for item in ranked[:PROCESS_ROWS_PER_RESOURCE]]
 
 
 class ProcessTracker:
@@ -214,14 +267,14 @@ class ProcessTracker:
         self.last_monotonic: float | None = None
         self.current_pids: set[int] = set()
 
-    def sample(self, proc: Path, monotonic: float) -> list[dict[str, Any]]:
+    def sample(self, proc: Path, monotonic: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         elapsed = monotonic - self.last_monotonic if self.last_monotonic is not None else 0
         current: dict[tuple[int, int], tuple[int, int]] = {}
         rows: list[dict[str, Any]] = []
         try:
             entries = list(proc.iterdir())
         except OSError:
-            return []
+            return [], []
         for process_path in entries:
             if not process_path.name.isdigit():
                 continue
@@ -229,7 +282,7 @@ class ProcessTracker:
                 if process_path.stat().st_uid != self.uid:
                     continue
                 pid = int(process_path.name)
-                comm, ticks, started, rss_pages = parse_process_stat(read_text(process_path / "stat"))
+                comm, ppid, ticks, started, rss_pages = parse_process_stat(read_text(process_path / "stat"))
                 io_bytes = parse_process_io(read_text(process_path / "io"))
                 executable = Path(os.readlink(process_path / "exe")).name
                 cgroup = read_text(process_path / "cgroup")
@@ -249,15 +302,29 @@ class ProcessTracker:
                     io_mib_per_second = io_delta / elapsed / (1024 * 1024)
             name = self.desktop_names.resolve(executable, cgroup)
             if not name:
-                name = script_basename(process_path, executable) or executable or comm
+                name = runtime_tool_name(process_path, executable) or executable or comm
             rows.append({
                 "key": f"{pid}:{started}",
                 "pid": pid,
-                "name": name[:80],
+                "ppid": ppid,
+                "executable": executable,
+                "name": friendly_process_name(name[:80]),
                 "rssMiB": round(max(0, rss_pages) * self.page_size / (1024 * 1024), 1),
                 "cpuPercent": round(max(0.0, cpu_percent), 1),
                 "ioMiBPerSecond": round(max(0.0, io_mib_per_second), 2),
             })
+        by_pid = {int(row["pid"]): row for row in rows}
+        for row in rows:
+            executable = str(row.get("executable", ""))
+            if executable not in ("node", "python", "python3", "bash", "sh"):
+                continue
+            owner = parent_owner(row, by_pid)
+            if owner:
+                row["ownerName"] = owner
+                if str(row["name"]).lower() in ("node", "python", "python3", "bash", "sh"):
+                    row["name"] = f"{friendly_process_name(executable)} helper (started by {owner})"
+                else:
+                    row["name"] = f"{row['name']} (started by {owner})"
         self.previous = current
         self.current_pids = {identity[0] for identity in current}
         self.last_monotonic = monotonic
@@ -265,7 +332,7 @@ class ProcessTracker:
         for key in ("rssMiB", "cpuPercent", "ioMiBPerSecond"):
             for row in sorted(rows, key=lambda item: float(item[key]), reverse=True)[:PROCESS_ROWS_PER_RESOURCE]:
                 selected[row["key"]] = row
-        return list(selected.values())
+        return list(selected.values()), aggregate_memory_apps(rows)
 
 
 def read_sample(proc: Path = Path("/proc"), process_tracker: ProcessTracker | None = None) -> dict[str, Any]:
@@ -294,7 +361,9 @@ def read_sample(proc: Path = Path("/proc"), process_tracker: ProcessTracker | No
         "memoryUsedPercent": round(100 * (1 - available / total_memory), 1) if total_memory else 0.0,
         "swapUsedMiB": round((swap_total - swap_free) / 1024, 1),
     }
-    sample["processes"] = process_tracker.sample(proc, monotonic) if process_tracker else []
+    processes, memory_apps = process_tracker.sample(proc, monotonic) if process_tracker else ([], [])
+    sample["processes"] = processes
+    sample["memoryApps"] = memory_apps
     sample["processPids"] = sorted(process_tracker.current_pids) if process_tracker else []
     return sample
 
@@ -338,7 +407,9 @@ def trigger_levels(metrics: dict[str, Any]) -> dict[str, int]:
     # swap as an incident only when throughput coincides with real pressure.
     memory_used = float(metrics.get("memoryUsedPercent", 0))
     if swap >= 256 and (memory >= 5 or io >= 5 or memory_used >= 90):
-        levels["swap"] = 3 if swap >= 4096 else 2 if swap >= 1024 else 1
+        # Swap throughput varies dramatically between compressed and disk-backed
+        # devices, so pressure signals determine high and critical severity.
+        levels["swap"] = 1
     return levels
 
 
@@ -387,7 +458,7 @@ def top_offenders(samples: Iterable[dict[str, Any]], causes: Iterable[str]) -> l
         for raw in sample.get("processes", []):
             if not isinstance(raw, dict):
                 continue
-            identity = str(raw.get("key") or f"{raw.get('pid', 0)}:{raw.get('name', '')}")
+            identity = f"{raw.get('pid', 0)}:{raw.get('name', '')}"
             row = {
                 "pid": int(raw.get("pid", 0)),
                 "name": str(raw.get("name", "Unknown"))[:80],
@@ -465,6 +536,7 @@ class Detector:
                     "preEvent": top_offenders(self.ring, sustained),
                     "peak": top_offenders([metrics], sustained),
                 },
+                "memoryOffenders": list(metrics.get("memoryApps", [])),
             }
         elif self.active is not None:
             causes = set(self.active.get("causes", [])) | set(sustained)
@@ -475,11 +547,14 @@ class Detector:
             self.active["severityLevel"] = level
             self.active["severity"] = severity_name(level)
             peak = self.active.setdefault("peak", {})
+            replace_memory_apps = float(metrics.get("memoryAvailableMiB", float("inf"))) <= float(peak.get("memoryAvailableMiB", float("inf")))
             for key, value in metric_snapshot(metrics).items():
                 if key == "memoryAvailableMiB":
                     peak[key] = min(float(peak.get(key, value)), value)
                 else:
                     peak[key] = max(float(peak.get(key, 0)), value)
+            if replace_memory_apps and metrics.get("memoryApps"):
+                self.active["memoryOffenders"] = list(metrics["memoryApps"])
             offenders = self.active.setdefault("offenders", {})
             peak_rows = offenders.get("peak", [])
             offenders["peak"] = top_offenders([{"processes": peak_rows}, metrics], causes)
@@ -545,6 +620,9 @@ def merge_incident(incidents: list[dict[str, Any]], incident: dict[str, Any]) ->
             for key, value in incident.get("peak", {}).items():
                 peak[key] = min(float(peak.get(key, value)), value) if key == "memoryAvailableMiB" else max(float(peak.get(key, 0)), value)
             merged["peak"] = peak
+            old_available = float(newest.get("peak", {}).get("memoryAvailableMiB", float("inf")))
+            new_available = float(incident.get("peak", {}).get("memoryAvailableMiB", float("inf")))
+            merged["memoryOffenders"] = list((incident if new_available <= old_available else newest).get("memoryOffenders", []))
             merged["recovery"] = incident.get("recovery", {})
             old_offenders = newest.get("offenders", {})
             new_offenders = incident.get("offenders", {})
@@ -559,8 +637,34 @@ def merge_incident(incidents: list[dict[str, Any]], incident: dict[str, Any]) ->
     return [incident, *incidents]
 
 
+def normalize_incident(row: dict[str, Any]) -> dict[str, Any]:
+    incident = dict(row)
+    causes = {str(cause) for cause in incident.get("causes", [])}
+    levels = trigger_levels(incident.get("peak", {}))
+    relevant = [level for cause, level in levels.items() if cause in causes]
+    if relevant:
+        incident["severityLevel"] = max(relevant)
+        incident["severity"] = severity_name(incident["severityLevel"])
+    if not isinstance(incident.get("memoryOffenders"), list):
+        legacy = incident.get("offenders", {}).get("preEvent", [])
+        rows = []
+        for raw in legacy if isinstance(legacy, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            if str(item.get("name", "")).lower() == "node":
+                item["name"] = "Node development task"
+            else:
+                item["name"] = friendly_process_name(str(item.get("name", "Unknown")))
+            rows.append(item)
+        incident["memoryOffenders"] = aggregate_memory_apps(rows)
+    return incident
+
+
 def valid_incidents(value: Any) -> list[dict[str, Any]]:
-    return [row for row in value if isinstance(row, dict) and isinstance(row.get("startTime"), str)] if isinstance(value, list) else []
+    if not isinstance(value, list):
+        return []
+    return [normalize_incident(row) for row in value if isinstance(row, dict) and isinstance(row.get("startTime"), str)]
 
 
 def load_state(path: Path) -> dict[str, Any]:
