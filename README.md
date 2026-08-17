@@ -31,6 +31,12 @@ If needed, place it on the right side of the bar:
 omarchy bar move swheel33.perfwatch --section right
 ```
 
+Remove the plugin with:
+
+```sh
+omarchy plugin remove swheel33.perfwatch
+```
+
 The shell hot-reloads plugin and bar changes. Click the bar icon to open the
 history panel and review each incident's plain-language cause and biggest
 memory users. Clearing history requires two clicks within five seconds.
