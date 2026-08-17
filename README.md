@@ -5,6 +5,11 @@ system-performance incidents. Perfwatch is intentionally not a live monitor:
 use tools such as btop for current process inspection, then use Perfwatch to
 see whether sustained pressure occurred while you were away.
 
+Perfwatch is especially useful on memory-constrained laptops, including
+lower-memory Dell XPS 13 configurations, where background applications and
+swap activity can cause a slowdown that is difficult to explain after the
+system recovers. It works on any Omarchy system with Linux pressure metrics.
+
 ## Features
 
 - Samples Linux `/proc` pressure and resource counters every five seconds.
