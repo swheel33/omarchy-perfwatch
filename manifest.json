@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "swheel33.perfwatch",
+  "name": "Perfwatch",
+  "version": "1.0.0",
+  "author": "swheel33",
+  "license": "MIT",
+  "description": "Record and review sustained Linux performance incidents from the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Perfwatch",
+    "description": "Historical CPU, memory, swap, and I/O pressure incidents.",
+    "category": "System",
+    "aliases": ["performance", "pressure", "psi"],
+    "allowMultiple": false
+  }
+}
